@@ -35,6 +35,32 @@ CREATE INDEX IF NOT EXISTS idx_notify_throttle_active
     ON pgmq.notify_insert_throttle (queue_name, last_notified_at)
     WHERE throttle_interval_ms > 0;
 
+CREATE TABLE IF NOT EXISTS pgmq.topic_bindings
+(
+    pattern        text NOT NULL, -- Wildcard pattern for routing key matching (* = one segment, # = zero or more segments)
+    queue_name     text NOT NULL  -- Name of the queue that receives messages when pattern matches
+        CONSTRAINT topic_bindings_meta_queue_name_fk
+            REFERENCES pgmq.meta (queue_name)
+            ON DELETE CASCADE,
+    compiled_regex text GENERATED ALWAYS AS (
+        -- Pre-compile the pattern to regex for faster matching
+        -- This avoids runtime compilation on every send_topic call
+        '^' ||
+        replace(
+                replace(
+                        regexp_replace(pattern, '([.+?{}()|\[\]\\^$])', '\\\1', 'g'),
+                        '*', '[^.]+'
+                ),
+                '#', '.*'
+        ) || '$'
+        ) STORED,                 -- Computed column: stores the compiled regex pattern
+    CONSTRAINT topic_bindings_unique_pattern_queue UNIQUE (pattern, queue_name)
+);
+
+-- Create covering index for better performance when scanning patterns
+-- Includes queue_name and compiled_regex to allow index-only scans (no table access needed)
+CREATE INDEX IF NOT EXISTS idx_topic_bindings_covering ON pgmq.topic_bindings (pattern) INCLUDE (queue_name, compiled_regex);
+
 -- Allow pgmq.meta to be dumped by `pg_dump` when pgmq is installed as an extension
 DO
 $$
@@ -42,6 +68,7 @@ BEGIN
     IF EXISTS(SELECT 1 FROM pg_extension WHERE extname = 'pgmq') THEN
         PERFORM pg_catalog.pg_extension_config_dump('pgmq.meta', '');
         PERFORM pg_catalog.pg_extension_config_dump('pgmq.notify_insert_throttle', '');
+        PERFORM pg_catalog.pg_extension_config_dump('pgmq.topic_bindings', '');
     END IF;
 END
 $$;
@@ -1580,3 +1607,248 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
+CREATE OR REPLACE FUNCTION pgmq.validate_routing_key(routing_key text)
+    RETURNS boolean
+    LANGUAGE plpgsql
+    IMMUTABLE
+AS
+$$
+BEGIN
+    -- Valid routing key examples:
+    --   "logs.error"
+    --   "app.user-service.auth"
+    --   "system_events.db.connection_failed"
+    --
+    -- Invalid routing key examples:
+    --   ""                     - empty
+    --   ".logs.error"          - starts with dot
+    --   "logs.error."          - ends with dot
+    --   "logs..error"          - consecutive dots
+    --   "logs.error!"          - invalid character
+    --   "logs error"           - space not allowed
+    --   "logs.*"               - wildcards not allowed in routing keys
+
+    IF routing_key IS NULL OR routing_key = '' THEN
+        RAISE EXCEPTION 'routing_key cannot be NULL or empty';
+    END IF;
+
+    IF length(routing_key) > 255 THEN
+        RAISE EXCEPTION 'routing_key length cannot exceed 255 characters, got % characters', length(routing_key);
+    END IF;
+
+    IF routing_key !~ '^[a-zA-Z0-9._-]+$' THEN
+        RAISE EXCEPTION 'routing_key contains invalid characters. Only alphanumeric, dots, hyphens, and underscores are allowed. Got: %', routing_key;
+    END IF;
+
+    IF routing_key ~ '^\.' THEN
+        RAISE EXCEPTION 'routing_key cannot start with a dot. Got: %', routing_key;
+    END IF;
+
+    IF routing_key ~ '\.$' THEN
+        RAISE EXCEPTION 'routing_key cannot end with a dot. Got: %', routing_key;
+    END IF;
+
+    IF routing_key ~ '\.\.' THEN
+        RAISE EXCEPTION 'routing_key cannot contain consecutive dots. Got: %', routing_key;
+    END IF;
+
+    RETURN true;
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION pgmq.validate_topic_pattern(pattern text)
+    RETURNS boolean
+    LANGUAGE plpgsql
+    IMMUTABLE
+AS
+$$
+BEGIN
+    -- Valid pattern examples:
+    --   "logs.*"           - matches one segment after logs. (e.g., logs.error, logs.info)
+    --   "logs.#"           - matches one or more segments after logs. (e.g., logs.error, logs.api.error)
+    --   "*.error"          - matches one segment before .error (e.g., app.error, db.error)
+    --   "#.error"          - matches one or more segments before .error (e.g., app.error, x.y.error)
+    --   "app.*.#"          - mixed wildcards (one segment then one or more)
+    --   "#"                - catch-all pattern, matches any routing key
+    --
+    -- Invalid pattern examples:
+    --   ".logs.*"          - starts with dot
+    --   "logs.*."          - ends with dot
+    --   "logs..error"      - consecutive dots
+    --   "logs.**"          - consecutive stars
+    --   "logs.##"          - consecutive hashes
+    --   "logs.*#"          - adjacent wildcards
+    --   "logs.error!"      - invalid character
+
+    IF pattern IS NULL OR pattern = '' THEN
+        RAISE EXCEPTION 'pattern cannot be NULL or empty';
+    END IF;
+
+    IF length(pattern) > 255 THEN
+        RAISE EXCEPTION 'pattern length cannot exceed 255 characters, got % characters', length(pattern);
+    END IF;
+
+    IF pattern !~ '^[a-zA-Z0-9._\-*#]+$' THEN
+        RAISE EXCEPTION 'pattern contains invalid characters. Only alphanumeric, dots, hyphens, underscores, *, and # are allowed. Got: %', pattern;
+    END IF;
+
+    IF pattern ~ '^\.' THEN
+        RAISE EXCEPTION 'pattern cannot start with a dot. Got: %', pattern;
+    END IF;
+
+    IF pattern ~ '\.$' THEN
+        RAISE EXCEPTION 'pattern cannot end with a dot. Got: %', pattern;
+    END IF;
+
+    IF pattern ~ '\.\.' THEN
+        RAISE EXCEPTION 'pattern cannot contain consecutive dots. Got: %', pattern;
+    END IF;
+
+    IF pattern ~ '\*\*' THEN
+        RAISE EXCEPTION 'pattern cannot contain consecutive stars (**). Use # for multi-segment matching. Got: %', pattern;
+    END IF;
+
+    IF pattern ~ '##' THEN
+        RAISE EXCEPTION 'pattern cannot contain consecutive hashes (##). A single # already matches zero or more segments. Got: %', pattern;
+    END IF;
+
+    IF pattern ~ '\*#' OR pattern ~ '#\*' THEN
+        RAISE EXCEPTION 'pattern cannot contain adjacent wildcards (*# or #*). Separate wildcards with dots. Got: %', pattern;
+    END IF;
+
+    RETURN true;
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION pgmq.bind_topic(pattern text, queue_name text)
+    RETURNS void
+    LANGUAGE plpgsql
+AS
+$$
+BEGIN
+    PERFORM pgmq.validate_topic_pattern(pattern);
+    IF queue_name IS NULL OR queue_name = '' THEN
+        RAISE EXCEPTION 'queue_name cannot be NULL or empty';
+    END IF;
+
+    IF NOT EXISTS (SELECT 1 FROM pgmq.meta WHERE meta.queue_name = bind_topic.queue_name) THEN
+        RAISE EXCEPTION 'Queue "%" does not exist. Create the queue first using pgmq.create()', queue_name;
+    END IF;
+
+    INSERT INTO pgmq.topic_bindings (pattern, queue_name)
+    VALUES (pattern, queue_name)
+    ON CONFLICT ON CONSTRAINT topic_bindings_unique_pattern_queue DO NOTHING;
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION pgmq.unbind_topic(pattern text, queue_name text)
+    RETURNS boolean
+    LANGUAGE plpgsql
+AS
+$$
+DECLARE
+    rows_deleted integer;
+BEGIN
+    IF pattern IS NULL OR pattern = '' THEN
+        RAISE EXCEPTION 'pattern cannot be NULL or empty';
+    END IF;
+
+    IF queue_name IS NULL OR queue_name = '' THEN
+        RAISE EXCEPTION 'queue_name cannot be NULL or empty';
+    END IF;
+
+    DELETE
+    FROM pgmq.topic_bindings
+    WHERE topic_bindings.pattern = unbind_topic.pattern
+      AND topic_bindings.queue_name = unbind_topic.queue_name;
+
+    GET DIAGNOSTICS rows_deleted = ROW_COUNT;
+
+    IF rows_deleted > 0 THEN
+        RETURN true;
+    ELSE
+        RETURN false;
+    END IF;
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION pgmq.test_routing(routing_key text)
+    RETURNS TABLE
+            (
+                pattern        text,
+                queue_name     text,
+                compiled_regex text
+            )
+    LANGUAGE plpgsql
+    STABLE
+AS
+$$
+BEGIN
+    PERFORM pgmq.validate_routing_key(routing_key);
+    RETURN QUERY
+        SELECT b.pattern,
+               b.queue_name,
+               b.compiled_regex
+        FROM pgmq.topic_bindings b
+        WHERE routing_key ~ b.compiled_regex
+        ORDER BY b.pattern;
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION pgmq.send_topic(routing_key text, msg jsonb, headers jsonb, delay integer)
+    RETURNS integer
+    LANGUAGE plpgsql
+    VOLATILE
+AS
+$$
+DECLARE
+    b             RECORD;
+    matched_count integer := 0;
+BEGIN
+    PERFORM pgmq.validate_routing_key(routing_key);
+
+    IF msg IS NULL THEN
+        RAISE EXCEPTION 'msg cannot be NULL';
+    END IF;
+
+    IF delay < 0 THEN
+        RAISE EXCEPTION 'delay cannot be negative, got: %', delay;
+    END IF;
+
+    -- Filter matching patterns in SQL for better performance (uses index)
+    -- Any failure will rollback the entire transaction
+    FOR b IN
+        SELECT tb.queue_name
+        FROM pgmq.topic_bindings tb
+        WHERE routing_key ~ tb.compiled_regex
+        ORDER BY tb.pattern -- Deterministic ordering
+        LOOP
+            PERFORM pgmq.send(b.queue_name, msg, headers, delay);
+            matched_count := matched_count + 1;
+        END LOOP;
+
+    RETURN matched_count;
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION pgmq.send_topic(routing_key text, msg jsonb)
+    RETURNS integer
+    LANGUAGE plpgsql
+    VOLATILE
+AS
+$$
+BEGIN
+    RETURN pgmq.send_topic(routing_key, msg, NULL, 0);
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION pgmq.send_topic(routing_key text, msg jsonb, delay integer)
+    RETURNS integer
+    LANGUAGE plpgsql
+    VOLATILE
+AS
+$$
+BEGIN
+    RETURN pgmq.send_topic(routing_key, msg, NULL, delay);
+END;
+$$;
