@@ -1,11 +1,9 @@
 use std::fmt::Display;
 
-use crate::{errors::PgmqError, types::Message};
+use crate::errors::PgmqError;
 
 use log::LevelFilter;
-use serde::Deserialize;
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
-use sqlx::FromRow;
 use sqlx::{ConnectOptions, Transaction};
 use sqlx::{Pool, Postgres};
 use url::{ParseError, Url};
@@ -33,25 +31,6 @@ pub async fn connect(url: &str, max_connections: u32) -> Result<Pool<Postgres>, 
         .connect_with(options)
         .await?;
     Ok(pgp)
-}
-
-// Executes a query and returns a single row
-// If the query returns no rows, None is returned
-// This function is intended for internal use.
-pub async fn fetch_one_message<T: for<'de> Deserialize<'de>>(
-    query: &str,
-    connection: &Pool<Postgres>,
-) -> Result<Option<Message<T>>, PgmqError> {
-    // explore: .fetch_optional()
-    let row = sqlx::query(query)
-        .fetch_one(connection)
-        .await
-        .and_then(|row| Message::<T>::from_row(&row));
-    match row {
-        Ok(row) => Ok(Some(row)),
-        Err(sqlx::error::Error::RowNotFound) => Ok(None),
-        Err(e) => Err(e)?,
-    }
 }
 
 /// A string that is known to be formed of only ASCII alphanumeric or an underscore;
