@@ -214,7 +214,7 @@
 //!
 //! ```rust,no_run
 //! use pgmq::{PgmqError, Message, PGMQueueExt};
-//! use serde::{Deserialize, Serialize};
+//! use serde_derive::{Deserialize, Serialize};
 //! use serde_json::Value;
 //!
 //! #[tokio::main]
@@ -267,10 +267,17 @@
 pub mod errors;
 #[cfg(feature = "install-sql")]
 pub mod install;
+#[cfg(feature = "sqlx")]
 pub mod pg_ext;
+pub(crate) mod private;
+#[cfg(feature = "queue-experimental")]
+pub mod queue;
+#[cfg(not(feature = "queue-experimental"))]
+pub(crate) mod queue;
 pub mod types;
 pub mod util;
 
 pub use errors::PgmqError;
+#[cfg(feature = "sqlx")]
 pub use pg_ext::PGMQueueExt;
 pub use types::Message;
